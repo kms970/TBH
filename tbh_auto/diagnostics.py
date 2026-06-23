@@ -4,6 +4,7 @@ from PIL import ImageDraw
 
 from .config import match_tolerance, minimum_match, reward_box_minimum_match
 from .constants import REWARD_BOX_TEMPLATES
+from .cube import find_auto_fill_button_by_shape
 from .models import Region, Template
 from .paths import LOG_DIR
 from .vision import find_template, find_template_in_screen_region
@@ -61,6 +62,8 @@ def scan_templates(
             )
         else:
             match = find_template(screen, template, tolerance, minimum)
+            if not match and name == "auto_fill":
+                match = find_auto_fill_button_by_shape(screen, config)
             if not match and name in REWARD_BOX_TEMPLATES:
                 match = find_reward_bubble_by_shape(screen, (name,), config)
         if match:

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import time
+from collections import deque
 
 import numpy as np
 from PIL import Image
@@ -139,6 +140,12 @@ def level_range_button_center(
         minimum_match,
         timeout_seconds=1.0,
     )
+    if auto_fill:
+        dx, dy = scale_offset((150, -223), config, auto_fill)
+        return auto_fill.center_x + dx, auto_fill.center_y + dy, auto_fill.scale
+
+    screen = capture_screen(region)
+    auto_fill = find_auto_fill_button_by_shape(screen, config or DEFAULT_CONFIG)
     if auto_fill:
         dx, dy = scale_offset((150, -223), config, auto_fill)
         return auto_fill.center_x + dx, auto_fill.center_y + dy, auto_fill.scale
@@ -364,6 +371,104 @@ def auto_fill_match_has_context(
     return False
 
 
+def find_auto_fill_button_by_shape(screen: ScreenShot, config: dict) -> Match | None:
+    rgb = screen.rgb.astype(np.int16)
+    red = rgb[:, :, 0]
+    green = rgb[:, :, 1]
+    blue = rgb[:, :, 2]
+    brownish = (
+        (red > 55)
+        & (red < 190)
+        & (green > 20)
+        & (green < 110)
+        & (blue < 70)
+        & (red > green + 15)
+    )
+    visited = np.zeros(brownish.shape, dtype=bool)
+    height, width = brownish.shape
+    ys, xs = np.nonzero(brownish)
+    best: Match | None = None
+    best_rank = -1.0
+
+    for start_y, start_x in zip(ys, xs):
+        if visited[start_y, start_x]:
+            continue
+        queue: deque[tuple[int, int]] = deque([(int(start_y), int(start_x))])
+        visited[start_y, start_x] = True
+        min_x = max_x = int(start_x)
+        min_y = max_y = int(start_y)
+        count = 0
+
+        while queue:
+            y, x = queue.popleft()
+            count += 1
+            if x < min_x:
+                min_x = x
+            elif x > max_x:
+                max_x = x
+            if y < min_y:
+                min_y = y
+            elif y > max_y:
+                max_y = y
+
+            for ny, nx in ((y - 1, x), (y + 1, x), (y, x - 1), (y, x + 1)):
+                if 0 <= ny < height and 0 <= nx < width and brownish[ny, nx] and not visited[ny, nx]:
+                    visited[ny, nx] = True
+                    queue.append((ny, nx))
+
+        box_w = max_x - min_x + 1
+        box_h = max_y - min_y + 1
+        density = count / max(1, box_w * box_h)
+        if box_w < 85 or box_w > 230 or box_h < 22 or box_h > 70 or density < 0.25 or density > 0.92:
+            continue
+
+        right_left = min(width, max_x + 3)
+        right_right = min(width, max_x + 140)
+        right_top = max(0, min_y - 4)
+        right_bottom = min(height, max_y + 5)
+        if right_right - right_left < 35 or right_bottom <= right_top:
+            continue
+        right_rgb = rgb[right_top:right_bottom, right_left:right_right, :]
+        right_saturation = right_rgb.max(axis=2) - right_rgb.min(axis=2)
+        right_dark = (
+            (right_rgb[:, :, 0] < 70)
+            & (right_rgb[:, :, 1] < 70)
+            & (right_rgb[:, :, 2] < 70)
+        )
+        right_orange = (
+            (right_rgb[:, :, 0] > 55)
+            & (right_rgb[:, :, 0] < 190)
+            & (right_rgb[:, :, 1] > 20)
+            & (right_rgb[:, :, 1] < 120)
+            & (right_rgb[:, :, 2] < 70)
+            & (right_rgb[:, :, 0] > right_rgb[:, :, 1] + 15)
+        )
+        dark_fraction = float(right_dark.mean())
+        saturated_fraction = float((right_saturation > 45).mean())
+        orange_fraction = float(right_orange.mean())
+        if dark_fraction < 0.45 or saturated_fraction > 0.25 or orange_fraction > 0.16:
+            continue
+
+        score = min(1.0, density * 0.55 + dark_fraction * 0.45 + (0.25 - saturated_fraction))
+        rank = score - abs(box_w - 115) / 500.0 - abs(box_h - 32) / 300.0
+        if rank > best_rank:
+            best_rank = rank
+            best = Match(
+                name="auto_fill",
+                left=int(screen.origin_x + min_x),
+                top=int(screen.origin_y + min_y),
+                width=box_w,
+                height=box_h,
+                score=float(score),
+                mean_diff=0.0,
+                scale=max(1.0, box_h / 28.0),
+            )
+
+    if best:
+        logging.info("found auto_fill by button shape at (%d, %d) score=%.3f", best.center_x, best.center_y, best.score)
+    return best
+
+
 def find_auto_fill_button(
     templates: dict[str, Template],
     region: Region | None,
@@ -464,6 +569,9 @@ def find_auto_fill_button(
                 match.center_x,
                 match.center_y,
             )
+        shape_match = find_auto_fill_button_by_shape(screen, config)
+        if shape_match:
+            return shape_match
         time.sleep(0.15)
     return None
 
