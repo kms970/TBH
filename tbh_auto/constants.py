@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-CURRENT_CONFIG_VERSION = 6
+CURRENT_CONFIG_VERSION = 8
 
 DEFAULT_CONFIG = {
     "config_schema_version": CURRENT_CONFIG_VERSION,
@@ -24,11 +24,21 @@ DEFAULT_CONFIG = {
     "search_region_follow_window": True,
     "search_region_from_window": None,
     "search_region_window_size": None,
+    "search_region_window_size_tolerance": 8,
     "bring_window_to_front": True,
     "prefer_print_window_capture": True,
     "print_window_capture_fallback": True,
     "window_title_keyword": "TaskBarHero",
     "window_region_padding": {"left": 0, "top": 0, "right": 0, "bottom": 0},
+    "window_client_padding": {"left": 8, "top": 32, "right": 8, "bottom": 8},
+    "excluded_window_title_keywords": [
+        "chrome",
+        "edge",
+        "firefox",
+        "github",
+        "visual studio code",
+        "codex",
+    ],
     "click_mode": "cursor",
     "cube_clear_attempts": 3,
     "back_offset_from_auto_fill": {"x": -11, "y": -50},
@@ -66,6 +76,9 @@ DEFAULT_CONFIG = {
     "reward_box_context_validation": True,
     "reward_box_shape_fallback": True,
     "reward_box_shape_min_score": 0.62,
+    "reward_box_blue_shape_min_score": 0.58,
+    "reward_box_shape_bridge_x": 2,
+    "reward_box_shape_bridge_y": 5,
     "reward_box_row_tolerance": 32,
     "reward_box_pair_min_distance": 45,
     "reward_box_pair_max_distance": 140,

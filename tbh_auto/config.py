@@ -58,6 +58,10 @@ def load_config() -> dict:
     if raw_version < 6:
         config["search_region_follow_window"] = True
         migrated = True
+    if raw_version < 8:
+        config["auto_follow_window"] = True
+        config["search_region_follow_window"] = True
+        migrated = True
     if raw_version < CURRENT_CONFIG_VERSION:
         config["config_schema_version"] = CURRENT_CONFIG_VERSION
         migrated = True

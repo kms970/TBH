@@ -125,14 +125,45 @@ def normalize_window_title(value: str) -> str:
     return re.sub(r"[^0-9a-z]+", "", value.lower())
 
 
+def window_title_match_score(title: str, keyword: str, config: dict | None = None) -> int | None:
+    lowered_title = title.lower()
+    lowered_keyword = keyword.strip().lower()
+    normalized_title = normalize_window_title(title)
+    normalized_keyword = normalize_window_title(keyword)
+    if not lowered_keyword or not normalized_keyword:
+        return None
+    if lowered_keyword not in lowered_title and normalized_keyword not in normalized_title:
+        return None
+
+    excluded = (config or {}).get("excluded_window_title_keywords", DEFAULT_CONFIG["excluded_window_title_keywords"])
+    is_excluded = any(str(token).lower() in lowered_title for token in excluded)
+    if normalized_title == normalized_keyword:
+        return 300
+    if lowered_title == lowered_keyword:
+        return 300
+    if lowered_title.startswith(lowered_keyword) or normalized_title.startswith(normalized_keyword):
+        return 220 if not is_excluded else 80
+    return 120 if not is_excluded else 20
+
+
+def apply_window_client_padding(window_region: Region, config: dict | None = None) -> Region:
+    padding = (config or {}).get("window_client_padding", DEFAULT_CONFIG["window_client_padding"])
+    left = window_region.left + int(padding.get("left", 0))
+    top = window_region.top + int(padding.get("top", 0))
+    right = window_region.right - int(padding.get("right", 0))
+    bottom = window_region.bottom - int(padding.get("bottom", 0))
+    if right - left < 100 or bottom - top < 100:
+        return window_region
+    return Region(left=left, top=top, width=right - left, height=bottom - top)
+
+
 def find_window_region_by_title(keyword: str, config: dict | None = None) -> Region | None:
     keyword = keyword.strip().lower()
-    normalized_keyword = normalize_window_title(keyword)
     if not keyword:
         clear_active_window()
         return None
 
-    matches: list[tuple[int, int, Region]] = []
+    matches: list[tuple[int, int, int, Region, str]] = []
 
     def callback(hwnd: int, _lparam: int) -> bool:
         if not user32.IsWindowVisible(hwnd):
@@ -140,8 +171,8 @@ def find_window_region_by_title(keyword: str, config: dict | None = None) -> Reg
         buffer = ctypes.create_unicode_buffer(512)
         user32.GetWindowTextW(hwnd, buffer, len(buffer))
         title = buffer.value.strip()
-        normalized_title = normalize_window_title(title)
-        if keyword not in title.lower() and normalized_keyword not in normalized_title:
+        score = window_title_match_score(title, keyword, config)
+        if score is None:
             return True
         rect = RECT()
         if not user32.GetWindowRect(hwnd, ctypes.byref(rect)):
@@ -157,17 +188,18 @@ def find_window_region_by_title(keyword: str, config: dict | None = None) -> Reg
         bottom = int(rect.bottom) - int(padding.get("bottom", 0))
         if right - left >= 100 and bottom - top >= 100:
             region = Region(left=left, top=top, width=right - left, height=bottom - top)
-            matches.append((region.width * region.height, int(hwnd), region))
+            matches.append((score, -abs((region.width * region.height) - (960 * 900)), int(hwnd), region, title))
         return True
 
     user32.EnumWindows(WNDENUMPROC(callback), 0)
     if not matches:
         clear_active_window()
         return None
-    matches.sort(key=lambda item: item[0], reverse=True)
-    hwnd = ctypes.c_void_p(matches[0][1])
-    region = matches[0][2]
-    set_active_window(int(matches[0][1]), region)
+    matches.sort(key=lambda item: (item[0], item[1]), reverse=True)
+    hwnd = ctypes.c_void_p(matches[0][2])
+    region = matches[0][3]
+    logging.info("selected window title: %s", matches[0][4])
+    set_active_window(int(matches[0][2]), region)
     if bool((config or {}).get("bring_window_to_front", True)):
         user32.ShowWindow(hwnd, 9)
         user32.BringWindowToTop(hwnd)
@@ -189,7 +221,26 @@ def relative_region_to_window(region: Region, window_region: Region) -> dict[str
 def window_relative_region_from_config(window_region: Region, config: dict) -> Region:
     relative = config.get("search_region_from_window")
     if not bool(config.get("search_region_follow_window", True)) or not isinstance(relative, dict):
-        return window_region
+        return apply_window_client_padding(window_region, config)
+
+    stored_size = config.get("search_region_window_size")
+    if isinstance(stored_size, dict):
+        try:
+            old_width = int(stored_size.get("width", window_region.width))
+            old_height = int(stored_size.get("height", window_region.height))
+            tolerance = int(config.get("search_region_window_size_tolerance", 8))
+        except (TypeError, ValueError):
+            old_width = window_region.width
+            old_height = window_region.height
+            tolerance = 8
+        if abs(window_region.width - old_width) > tolerance or abs(window_region.height - old_height) > tolerance:
+            logging.warning(
+                "window size changed from %dx%d to %dx%d; saved relative search region may need recalibration.",
+                old_width,
+                old_height,
+                window_region.width,
+                window_region.height,
+            )
 
     try:
         left = window_region.left + int(relative.get("left", 0))
@@ -197,15 +248,15 @@ def window_relative_region_from_config(window_region: Region, config: dict) -> R
         width = int(relative.get("width", window_region.width))
         height = int(relative.get("height", window_region.height))
     except (TypeError, ValueError):
-        return window_region
+        return apply_window_client_padding(window_region, config)
 
     left = max(window_region.left, left)
     top = max(window_region.top, top)
     right = min(window_region.right, left + width)
     bottom = min(window_region.bottom, top + height)
     if right - left < 100 or bottom - top < 100:
-        logging.warning("saved follow-window region is outside the current window; using the whole window.")
-        return window_region
+        logging.warning("saved follow-window region is outside the current window; using the client area.")
+        return apply_window_client_padding(window_region, config)
     return Region(left=left, top=top, width=right - left, height=bottom - top)
 
 
