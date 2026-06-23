@@ -82,6 +82,7 @@ DEFAULT_CONFIG = {
     "reward_box_row_tolerance": 32,
     "reward_box_pair_min_distance": 45,
     "reward_box_pair_max_distance": 140,
+    "reward_box_pair_preferred_distance": 64,
     "reward_box_search_area_from_region": {
         "left": 300,
         "top": 500,

@@ -5,7 +5,7 @@ from PIL import ImageDraw
 from .config import match_tolerance, minimum_match, reward_box_minimum_match
 from .constants import REWARD_BOX_TEMPLATES
 from .cube import find_auto_fill_button_by_shape
-from .models import Region, Template
+from .models import Match, Region, Template
 from .paths import LOG_DIR
 from .vision import find_template, find_template_in_screen_region
 from .windows import capture_screen
@@ -21,12 +21,13 @@ def scan_templates(
     templates: dict[str, Template],
     region: Region | None,
     config: dict,
-) -> None:
+) -> dict[str, Match | None]:
     default_tolerance = match_tolerance(config)
     default_minimum = minimum_match(config)
     screen = capture_screen(region)
     preview = screen.image.convert("RGB")
     draw = ImageDraw.Draw(preview)
+    matches: dict[str, Match | None] = {}
     scan_transfer = None
     if "storage_to_bag" in templates:
         scan_transfer = find_template(
@@ -66,6 +67,7 @@ def scan_templates(
                 match = find_auto_fill_button_by_shape(screen, config)
             if not match and name in REWARD_BOX_TEMPLATES:
                 match = find_reward_bubble_by_shape(screen, (name,), config)
+        matches[name] = match
         if match:
             print(
                 f"{name:16} 인식됨 ({match.center_x}, {match.center_y}) "
@@ -86,3 +88,4 @@ def scan_templates(
     out_path = LOG_DIR / "last_scan.png"
     preview.save(out_path)
     print(f"검사 이미지 저장: {out_path}")
+    return matches

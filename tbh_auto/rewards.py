@@ -315,28 +315,39 @@ def find_reward_bubble_by_shape(
     row_tolerance = scale_length(int(config.get("reward_box_row_tolerance", 80)), config)
     pair_min_distance = scale_length(int(config.get("reward_box_pair_min_distance", 45)), config)
     pair_max_distance = scale_length(int(config.get("reward_box_pair_max_distance", 140)), config)
+    pair_preferred_distance = scale_length(int(config.get("reward_box_pair_preferred_distance", 64)), config)
 
-    def has_reward_pair(match: Match) -> bool:
-        for other, _score in candidates:
+    def reward_pair_bonus(match: Match) -> float:
+        best_bonus = 0.0
+        distance_range = max(1, pair_max_distance - pair_min_distance)
+        for other, other_score in candidates:
             if other is match:
                 continue
             if other.name == match.name:
                 continue
+            if match.name == "reward_blue_box_bubble" and other.center_x <= match.center_x:
+                continue
+            if match.name == "reward_chest_bubble" and other.center_x >= match.center_x:
+                continue
             dx = abs(other.center_x - match.center_x)
             dy = abs(other.center_y - match.center_y)
-            if dy <= row_tolerance and pair_min_distance <= dx <= pair_max_distance:
-                return True
-        return False
+            if dy > row_tolerance or dx < pair_min_distance or dx > pair_max_distance:
+                continue
+            distance_quality = max(0.0, 1.0 - abs(dx - pair_preferred_distance) / distance_range)
+            row_quality = max(0.0, 1.0 - dy / max(1, row_tolerance))
+            bonus = 0.35 + distance_quality * 0.20 + row_quality * 0.15 + min(1.0, other_score) * 0.10
+            best_bonus = max(best_bonus, bonus)
+        return best_bonus
 
     best: Match | None = None
     best_rank = -1.0
     for match, score in candidates:
         if match.name not in allowed_names:
             continue
-        paired = has_reward_pair(match)
-        if row_center_y is None and match.name == "reward_blue_box_bubble" and not paired:
+        pair_bonus = reward_pair_bonus(match)
+        if row_center_y is None and match.name == "reward_blue_box_bubble" and pair_bonus <= 0:
             continue
-        rank = score + (0.35 if paired else 0.0)
+        rank = score + pair_bonus
         if row_center_y is not None:
             rank += 0.25
         if rank > best_rank:

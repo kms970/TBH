@@ -6,6 +6,7 @@ import time
 
 from .config import configure_logging, load_config
 from .diagnostics import scan_templates
+from .live_qa import run_settings_qa
 from .state import set_active_config
 from .vision import load_templates
 from .windows import calibrate_region, enable_dpi_awareness, parse_region
@@ -28,6 +29,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--once", action="store_true", help="Run one combine cycle and exit.")
     parser.add_argument("--scan", action="store_true", help="Only scan buttons and save logs/last_scan.png.")
     parser.add_argument("--calibrate", action="store_true", help="Save a screen search region to config.json.")
+    parser.add_argument("--qa-settings", action="store_true", help="Run live QA for game window size and UI layout settings.")
     parser.add_argument("--region", help="Override search region: left,top,width,height.")
     parser.add_argument("--interval", type=int, help="Seconds between automatic runs.")
     parser.add_argument("--verbose", action="store_true", help="Print debug logs.")
@@ -55,6 +57,9 @@ def main() -> int:
     if args.scan:
         scan_templates(templates, region, config)
         return 0
+
+    if args.qa_settings:
+        return 0 if run_settings_qa(config) else 1
 
     if args.once:
         run_once(templates, region, config)
