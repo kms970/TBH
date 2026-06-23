@@ -2,9 +2,13 @@
 
 Task Bar Hero 화면에서 버튼 이미지를 찾아 실제 마우스 클릭으로 상자 열기, 장비/재료 합성, 창고 이동을 진행하는 윈도우용 도우미입니다.
 
+## 다운로드
+
+최신 공유용 ZIP은 [GitHub Releases](https://github.com/kms970/TBH/releases/latest)에서 받으면 됩니다.
+
 ## 바로 사용하기
 
-공유받는 사람에게는 `release` 폴더의 ZIP 파일을 전달하세요.
+공유받는 사람에게는 [최신 릴리즈](https://github.com/kms970/TBH/releases/latest) 링크를 전달하세요.
 
 1. ZIP 압축을 풉니다.
 2. `TaskBarHeroAutoSynth.exe`를 실행합니다.
