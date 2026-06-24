@@ -33,6 +33,78 @@ from .vision import find, find_template, find_template_in_screen_region, wait_fo
 from .windows import capture_screen, click_at
 
 
+def scale_from_reference(reference: object | None, config: dict | None = None) -> float:
+    if isinstance(reference, (int, float)):
+        return max(0.5, float(reference))
+    if reference is not None:
+        try:
+            return max(0.5, float(getattr(reference, "scale")))
+        except (TypeError, ValueError, AttributeError):
+            pass
+    return screen_scale_factor(config)
+
+
+def screen_crop(
+    screen: ScreenShot,
+    center_x: int,
+    center_y: int,
+    half_width: int,
+    half_height: int,
+) -> np.ndarray | None:
+    local_left = center_x - half_width - screen.origin_x
+    local_top = center_y - half_height - screen.origin_y
+    local_right = center_x + half_width - screen.origin_x
+    local_bottom = center_y + half_height - screen.origin_y
+    if local_right <= 0 or local_bottom <= 0 or local_left >= screen.rgb.shape[1] or local_top >= screen.rgb.shape[0]:
+        return None
+    local_left = max(0, local_left)
+    local_top = max(0, local_top)
+    local_right = min(screen.rgb.shape[1], local_right)
+    local_bottom = min(screen.rgb.shape[0], local_bottom)
+    if local_right <= local_left or local_bottom <= local_top:
+        return None
+    return screen.rgb[local_top:local_bottom, local_left:local_right, :]
+
+
+def orange_close_button_near(screen: ScreenShot, center_x: int, center_y: int, reference: object | None, config: dict) -> bool:
+    scale = scale_from_reference(reference, config)
+    radius = max(14, int(round(20 * scale)))
+    crop = screen_crop(screen, center_x, center_y, radius, radius)
+    if crop is None or crop.size == 0:
+        return False
+
+    rgb = crop.astype(np.int16)
+    red = rgb[:, :, 0]
+    green = rgb[:, :, 1]
+    blue = rgb[:, :, 2]
+    orange = (red > 145) & (green > 35) & (green < 130) & (blue < 95) & (red > green + 50)
+    count = int(orange.sum())
+    if count < max(24, int(round(35 * scale * scale))):
+        return False
+
+    ys, xs = np.nonzero(orange)
+    if xs.size == 0:
+        return False
+    width = int(xs.max() - xs.min() + 1)
+    height = int(ys.max() - ys.min() + 1)
+    min_size = max(6, int(round(8 * scale)))
+    max_size = max(min_size + 1, int(round(36 * scale)))
+    return min_size <= width <= max_size and min_size <= height <= max_size
+
+
+def level_center_has_close_context(
+    screen: ScreenShot,
+    center_x: int,
+    center_y: int,
+    reference: object | None,
+    config: dict,
+) -> bool:
+    offset = config.get("cube_close_offset_from_level_button", DEFAULT_CONFIG["cube_close_offset_from_level_button"])
+    close_x = center_x + scale_length(int(offset.get("x", 46)), config, reference)
+    close_y = center_y + scale_length(int(offset.get("y", -43)), config, reference)
+    return orange_close_button_near(screen, close_x, close_y, reference, config)
+
+
 def select_auto_fill_category(
     category: str,
     templates: dict[str, Template],
@@ -116,41 +188,106 @@ def level_range_button_center(
     minimum_match: float,
     config: dict | None = None,
 ) -> tuple[int, int, float] | None:
-    level_tolerance = max(tolerance, 90 if screen_scale_factor(config) > 1.0 else tolerance)
-    level_minimum = min(minimum_match, 0.95 if screen_scale_factor(config) > 1.0 else minimum_match)
-
-    current = find("level_range_button_20_40", templates, region, level_tolerance, level_minimum)
-    if current:
-        return current.center_x, current.center_y, current.scale
-
-    sample = find("level_range_button_sample", templates, region, level_tolerance, level_minimum)
-    if sample:
-        return sample.center_x, sample.center_y, sample.scale
-
-    reference = find("auto_fill_dropdown", templates, region, tolerance, minimum_match)
-    if reference:
-        dx, dy = scale_offset((82, -224), config, reference)
-        return reference.center_x + dx, reference.center_y + dy, reference.scale
-
-    auto_fill = wait_for(
-        AUTO_FILL_BUTTON_TEMPLATES,
-        templates,
-        region,
-        tolerance,
-        minimum_match,
-        timeout_seconds=1.0,
-    )
-    if auto_fill:
-        dx, dy = scale_offset((150, -223), config, auto_fill)
-        return auto_fill.center_x + dx, auto_fill.center_y + dy, auto_fill.scale
-
+    active_config = config or DEFAULT_CONFIG
     screen = capture_screen(region)
-    auto_fill = find_auto_fill_button_by_shape(screen, config or DEFAULT_CONFIG)
+
+    level_tolerance = max(tolerance, 90 if screen_scale_factor(active_config) > 1.0 else tolerance)
+    level_minimum = min(minimum_match, 0.95 if screen_scale_factor(active_config) > 1.0 else minimum_match)
+
+    for name in ("level_range_button_20_40", "level_range_button_sample"):
+        match = find_template(screen, templates[name], level_tolerance, level_minimum)
+        if not match:
+            continue
+        if level_range_match_has_context(screen, match, templates, active_config):
+            logging.info(
+                "found %-15s at (%d, %d) score=%.3f scale=%gx",
+                name,
+                match.center_x,
+                match.center_y,
+                match.score,
+                match.scale,
+            )
+            return match.center_x, match.center_y, match.scale
+        logging.debug("reject %-15s at (%d, %d): level button context was not found", name, match.center_x, match.center_y)
+
+    mode = find_template(
+        screen,
+        templates["cube_mode_option_combine"],
+        max(control_match_tolerance(active_config), int(active_config.get("cube_mode_option_match_tolerance", 120))),
+        min(control_minimum_match(active_config), float(active_config.get("cube_mode_option_minimum_match", 0.80))),
+    )
+    if mode:
+        dx = scale_length(155, active_config, mode)
+        center_x = mode.center_x + dx
+        center_y = mode.center_y
+        if level_center_has_close_context(screen, center_x, center_y, mode, active_config):
+            return center_x, center_y, mode.scale
+        logging.debug("reject cube mode anchor at (%d, %d): level close context was not found", mode.center_x, mode.center_y)
+
+    reference = find_template(screen, templates["auto_fill_dropdown"], tolerance, minimum_match)
+    if reference:
+        dx, dy = scale_offset((82, -224), active_config, reference)
+        center_x = reference.center_x + dx
+        center_y = reference.center_y + dy
+        if level_center_has_close_context(screen, center_x, center_y, reference, active_config):
+            return center_x, center_y, reference.scale
+        logging.debug(
+            "reject auto-fill dropdown anchor at (%d, %d): level close context was not found",
+            reference.center_x,
+            reference.center_y,
+        )
+
+    auto_fill = find_auto_fill_button(templates, region, active_config, timeout_seconds=0.4)
     if auto_fill:
-        dx, dy = scale_offset((150, -223), config, auto_fill)
-        return auto_fill.center_x + dx, auto_fill.center_y + dy, auto_fill.scale
+        dx, dy = scale_offset((150, -223), active_config, auto_fill)
+        center_x = auto_fill.center_x + dx
+        center_y = auto_fill.center_y + dy
+        if level_center_has_close_context(screen, center_x, center_y, auto_fill, active_config):
+            return center_x, center_y, auto_fill.scale
+        logging.debug("reject auto-fill template anchor at (%d, %d): level close context was not found", auto_fill.center_x, auto_fill.center_y)
+
+    auto_fill = find_auto_fill_button_by_shape(screen, active_config)
+    if auto_fill:
+        dx, dy = scale_offset((150, -223), active_config, auto_fill)
+        center_x = auto_fill.center_x + dx
+        center_y = auto_fill.center_y + dy
+        if level_center_has_close_context(screen, center_x, center_y, auto_fill, active_config):
+            return center_x, center_y, auto_fill.scale
+        logging.debug("reject auto-fill shape anchor at (%d, %d): level close context was not found", auto_fill.center_x, auto_fill.center_y)
 
     return None
+
+
+def level_range_match_has_context(
+    screen: ScreenShot,
+    match: Match,
+    templates: dict[str, Template],
+    config: dict,
+) -> bool:
+    if level_center_has_close_context(screen, match.center_x, match.center_y, match, config):
+        return True
+
+    expected_x = match.center_x - scale_length(150, config, match)
+    expected_y = match.center_y + scale_length(223, config, match)
+    radius_x = max(50, scale_length(75, config, match))
+    radius_y = max(30, scale_length(45, config, match))
+    search_region = Region(
+        left=expected_x - radius_x,
+        top=expected_y - radius_y,
+        width=radius_x * 2,
+        height=radius_y * 2,
+    )
+    for name in AUTO_FILL_BUTTON_TEMPLATES:
+        auto_fill = find_template_in_screen_region(
+            screen,
+            templates[name],
+            search_region,
+            control_match_tolerance(config),
+            control_minimum_match(config),
+        )
+        if auto_fill is not None and auto_fill_match_has_context(screen, auto_fill, templates, config):
+            return True
+    return False
 
 
 def level_range_row_is_locked(
@@ -734,9 +871,9 @@ def close_cube_mode_dropdown_if_needed(
         return
 
     mode_center = (center[0] - scale_length(155, config, center[2]), center[1], center[2])
-    logging.info("close cube mode dropdown via combine option.")
-    click_cube_combine_option_by_offset(mode_center, config, click_delay)
-    time.sleep(0.2)
+    if click_cube_combine_option_if_visible(templates, region, mode_center, config, click_delay):
+        logging.info("close cube mode dropdown via combine option.")
+        time.sleep(0.2)
 
 
 def click_cube_combine_option_by_offset(
@@ -747,6 +884,47 @@ def click_cube_combine_option_by_offset(
     option_y = button_center[1] + scale_length(int(config.get("cube_mode_combine_option_offset_y", 29)), config, button_center[2])
     logging.info("select cube combine option by offset at (%d, %d)", button_center[0], option_y)
     click_at(button_center[0], option_y, click_delay)
+
+
+def cube_mode_option_region(button_center: tuple[int, int, float], config: dict) -> Region:
+    scale = button_center[2]
+    return Region(
+        left=button_center[0] - scale_length(105, config, scale),
+        top=button_center[1] + scale_length(6, config, scale),
+        width=scale_length(210, config, scale),
+        height=scale_length(92, config, scale),
+    )
+
+
+def find_cube_combine_option(
+    templates: dict[str, Template],
+    screen: ScreenShot,
+    button_center: tuple[int, int, float],
+    config: dict,
+) -> Match | None:
+    return find_template_in_screen_region(
+        screen,
+        templates["cube_mode_option_combine"],
+        cube_mode_option_region(button_center, config),
+        max(control_match_tolerance(config), int(config.get("cube_mode_option_match_tolerance", 120))),
+        min(control_minimum_match(config), float(config.get("cube_mode_option_minimum_match", 0.80))),
+    )
+
+
+def click_cube_combine_option_if_visible(
+    templates: dict[str, Template],
+    region: Region | None,
+    button_center: tuple[int, int, float],
+    config: dict,
+    click_delay: float,
+) -> bool:
+    screen = capture_screen(region)
+    option = find_cube_combine_option(templates, screen, button_center, config)
+    if not option:
+        return False
+    logging.info("select cube combine option at (%d, %d) score=%.3f", option.center_x, option.center_y, option.score)
+    click_match(option, click_delay)
+    return True
 
 
 def cube_mode_button_center(
@@ -824,24 +1002,17 @@ def ensure_cube_combine_mode(
 
     mode_center = (center[0] - scale_length(155, config, center[2]), center[1], center[2])
 
-    # If the mode dropdown is already open, selecting the first row switches back to combine.
-    click_cube_combine_option_by_offset(mode_center, config, click_delay)
-    switched = wait_for(
-        ("auto_fill_dropdown", "combine_ready", "combine_tab"),
-        templates,
-        region,
-        control_tolerance,
-        control_minimum,
-        timeout_seconds=1.0,
-    )
-    if switched:
-        close_cube_mode_dropdown_if_needed(templates, region, config, click_delay)
-        return True
+    if click_cube_combine_option_if_visible(templates, region, mode_center, config, click_delay):
+        if auto_fill_visible(templates, region, config, timeout_seconds=1.0) or cube_mode_is_combine(templates, region, config):
+            close_cube_mode_dropdown_if_needed(templates, region, config, click_delay)
+            return True
 
     logging.info("open cube mode dropdown at (%d, %d)", mode_center[0], mode_center[1])
     click_at(mode_center[0], mode_center[1], click_delay)
     time.sleep(0.15)
-    click_cube_combine_option_by_offset(mode_center, config, click_delay)
+    if not click_cube_combine_option_if_visible(templates, region, mode_center, config, click_delay):
+        logging.warning("cube combine option was not found after opening the mode dropdown.")
+        return False
 
     switched = wait_for(
         ("auto_fill_dropdown", "combine_ready", "combine_tab"),

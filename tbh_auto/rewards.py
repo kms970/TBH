@@ -14,7 +14,7 @@ from .config import (
     scale_length,
     screen_scale_factor,
 )
-from .constants import DEFAULT_CONFIG, REWARD_BOX_TEMPLATES
+from .constants import DEFAULT_CONFIG, REWARD_BOX_TEMPLATES, SCREEN_SCALE_CHOICES
 from .cube import level_range_button_center
 from .input import click_match
 from .models import Match, Region, ScreenShot, Template
@@ -114,6 +114,23 @@ def reward_box_shape_minimum_score(name: str, config: dict) -> float:
     return minimum
 
 
+def reward_box_shape_scales(config: dict) -> tuple[float, ...]:
+    values = [screen_scale_factor(config)]
+    if bool(config.get("multi_scale_matching", True)):
+        for choice in SCREEN_SCALE_CHOICES.values():
+            factor = float(choice["factor"])
+            if all(abs(factor - existing) > 0.001 for existing in values):
+                values.append(factor)
+    return tuple(values)
+
+
+def estimate_reward_box_scale(width: int, height: int, scales: tuple[float, ...]) -> float:
+    if not scales:
+        return 1.0
+    estimated = max(width / 64.0, height / 46.0)
+    return min(scales, key=lambda value: abs(value - estimated))
+
+
 def dilate_boolean_mask(mask: np.ndarray, radius_x: int, radius_y: int) -> np.ndarray:
     if radius_x <= 0 and radius_y <= 0:
         return mask
@@ -199,14 +216,16 @@ def find_reward_bubble_by_shape(
     if not allowed_names:
         return None
 
-    scale = screen_scale_factor(config)
-    min_w = max(18, int(round(32 * scale)))
-    max_w = max(min_w + 1, int(round(90 * scale)))
-    min_h = max(14, int(round(22 * scale)))
-    max_h = max(min_h + 1, int(round(65 * scale)))
-    min_area = max(120, int(round(220 * scale * scale)))
-    bridge_x = max(0, scale_length(int(config.get("reward_box_shape_bridge_x", 2)), config))
-    bridge_y = max(0, scale_length(int(config.get("reward_box_shape_bridge_y", 5)), config))
+    scales = reward_box_shape_scales(config)
+    min_scale = min(scales)
+    max_scale = max(scales)
+    min_w = max(18, int(round(32 * min_scale)))
+    max_w = max(min_w + 1, int(round(90 * max_scale)))
+    min_h = max(14, int(round(22 * min_scale)))
+    max_h = max(min_h + 1, int(round(65 * max_scale)))
+    min_area = max(120, int(round(180 * min_scale * min_scale)))
+    bridge_x = max(0, int(round(int(config.get("reward_box_shape_bridge_x", 2)) * max_scale)))
+    bridge_y = max(0, int(round(int(config.get("reward_box_shape_bridge_y", 5)) * max_scale)))
 
     rgb = screen.rgb
     whiteish = (rgb[:, :, 0] > 210) & (rgb[:, :, 1] > 210) & (rgb[:, :, 2] > 210)
@@ -224,6 +243,7 @@ def find_reward_bubble_by_shape(
         name, score = classified
         if score < reward_box_shape_minimum_score(name, config):
             return
+        candidate_scale = estimate_reward_box_scale(crop_right - crop_left, crop_bottom - crop_top, scales)
         candidates.append(
             (
                 Match(
@@ -234,7 +254,7 @@ def find_reward_bubble_by_shape(
                     height=int(crop_bottom - crop_top),
                     score=float(score),
                     mean_diff=0.0,
-                    scale=scale,
+                    scale=candidate_scale,
                 ),
                 score,
             )
@@ -260,18 +280,15 @@ def find_reward_bubble_by_shape(
         if aspect < 0.9 or aspect > 3.8 or white_density < 0.10:
             continue
 
-        pad = max(2, int(round(4 * scale)))
+        candidate_scale = estimate_reward_box_scale(box_w, box_h, scales)
+        pad = max(2, int(round(4 * candidate_scale)))
         crop_left = max(0, content_min_x - pad)
         crop_top = max(0, content_min_y - pad)
         crop_right = min(width, content_max_x + pad + 1)
         crop_bottom = min(height, content_max_y + pad + 1)
         append_candidate(crop_left, crop_top, crop_right, crop_bottom)
 
-    raw_min_count = max(20, int(round(20 * scale * scale)))
-    window_w = max(min_w, scale_length(64, config))
-    window_h = max(min_h, scale_length(46, config))
-    x_offsets = tuple(scale_length(value, config) for value in (-18, 0, 18))
-    y_offsets = tuple(scale_length(value, config) for value in (-6, 0, 6))
+    raw_min_count = max(20, int(round(16 * min_scale * min_scale)))
     seen_windows: set[tuple[int, int, int, int]] = set()
 
     for min_x, min_y, max_x, max_y, count in iter_mask_components(whiteish):
@@ -283,28 +300,34 @@ def find_reward_bubble_by_shape(
             continue
         base_x = (min_x + max_x) // 2
         base_y = (min_y + max_y) // 2
-        for offset_x in x_offsets:
-            for offset_y in y_offsets:
-                center_x = base_x + offset_x
-                center_y = base_y + offset_y
-                crop_left = max(0, center_x - window_w // 2)
-                crop_top = max(0, center_y - window_h // 2)
-                crop_right = min(width, crop_left + window_w)
-                crop_bottom = min(height, crop_top + window_h)
-                if crop_right - crop_left < window_w or crop_bottom - crop_top < window_h:
-                    continue
-                key = (crop_left, crop_top, crop_right, crop_bottom)
-                if key in seen_windows:
-                    continue
-                seen_windows.add(key)
-                if int(whiteish[crop_top:crop_bottom, crop_left:crop_right].sum()) < min_area:
-                    continue
-                append_candidate(crop_left, crop_top, crop_right, crop_bottom)
+        for scale in scales:
+            scale_min_area = max(20, int(round(160 * scale * scale)))
+            window_w = max(min_w, int(round(64 * scale)))
+            window_h = max(min_h, int(round(46 * scale)))
+            x_offsets = tuple(int(round(value * scale)) for value in (-18, 0, 18))
+            y_offsets = tuple(int(round(value * scale)) for value in (-6, 0, 6))
+            for offset_x in x_offsets:
+                for offset_y in y_offsets:
+                    center_x = base_x + offset_x
+                    center_y = base_y + offset_y
+                    crop_left = max(0, center_x - window_w // 2)
+                    crop_top = max(0, center_y - window_h // 2)
+                    crop_right = min(width, crop_left + window_w)
+                    crop_bottom = min(height, crop_top + window_h)
+                    if crop_right - crop_left < window_w or crop_bottom - crop_top < window_h:
+                        continue
+                    key = (crop_left, crop_top, crop_right, crop_bottom)
+                    if key in seen_windows:
+                        continue
+                    seen_windows.add(key)
+                    if int(whiteish[crop_top:crop_bottom, crop_left:crop_right].sum()) < scale_min_area:
+                        continue
+                    append_candidate(crop_left, crop_top, crop_right, crop_bottom)
 
     if row_center_y is not None or blocked_positions:
         filtered_candidates: list[tuple[Match, float]] = []
-        row_tolerance = scale_length(int(config.get("reward_box_row_tolerance", 80)), config)
         for match, score in candidates:
+            row_tolerance = scale_length(int(config.get("reward_box_row_tolerance", 80)), config, match)
             if row_center_y is not None and abs(match.center_y - row_center_y) > row_tolerance:
                 continue
             if blocked_positions and reward_box_position_key(match, config) in blocked_positions:
@@ -312,13 +335,12 @@ def find_reward_bubble_by_shape(
             filtered_candidates.append((match, score))
         candidates = filtered_candidates
 
-    row_tolerance = scale_length(int(config.get("reward_box_row_tolerance", 80)), config)
-    pair_min_distance = scale_length(int(config.get("reward_box_pair_min_distance", 45)), config)
-    pair_max_distance = scale_length(int(config.get("reward_box_pair_max_distance", 140)), config)
-    pair_preferred_distance = scale_length(int(config.get("reward_box_pair_preferred_distance", 64)), config)
-
     def reward_pair_bonus(match: Match) -> float:
         best_bonus = 0.0
+        row_tolerance = scale_length(int(config.get("reward_box_row_tolerance", 80)), config, match)
+        pair_min_distance = scale_length(int(config.get("reward_box_pair_min_distance", 45)), config, match)
+        pair_max_distance = scale_length(int(config.get("reward_box_pair_max_distance", 140)), config, match)
+        pair_preferred_distance = scale_length(int(config.get("reward_box_pair_preferred_distance", 64)), config, match)
         distance_range = max(1, pair_max_distance - pair_min_distance)
         for other, other_score in candidates:
             if other is match:
