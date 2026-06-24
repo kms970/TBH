@@ -80,6 +80,7 @@ DEFAULT_CONFIG = {
     "reward_box_shape_bridge_x": 2,
     "reward_box_shape_bridge_y": 5,
     "reward_box_row_tolerance": 32,
+    "reward_box_pair_required_without_row": True,
     "reward_box_pair_min_distance": 45,
     "reward_box_pair_max_distance": 140,
     "reward_box_pair_preferred_distance": 64,

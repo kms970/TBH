@@ -237,7 +237,7 @@ def find_reward_bubble_by_shape(
         if crop_right <= crop_left or crop_bottom <= crop_top:
             return
         crop_rgb = rgb[crop_top:crop_bottom, crop_left:crop_right, :]
-        classified = classify_reward_bubble(crop_rgb, set(REWARD_BOX_TEMPLATES))
+        classified = classify_reward_bubble(crop_rgb, allowed_names)
         if not classified:
             return
         name, score = classified
@@ -367,7 +367,8 @@ def find_reward_bubble_by_shape(
         if match.name not in allowed_names:
             continue
         pair_bonus = reward_pair_bonus(match)
-        if row_center_y is None and match.name == "reward_blue_box_bubble" and pair_bonus <= 0:
+        pair_required = row_center_y is None and bool(config.get("reward_box_pair_required_without_row", True))
+        if pair_required and pair_bonus <= 0:
             continue
         rank = score + pair_bonus
         if row_center_y is not None:
@@ -506,6 +507,8 @@ def open_reward_boxes(
             timeout_seconds=0.7,
         )
         if not match:
+            if opened == 0:
+                logging.info("reward boxes were not found.")
             break
 
         type_limit = int(max_clicks_by_type.get(match.name, 0) or 0)
