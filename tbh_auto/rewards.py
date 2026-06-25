@@ -6,6 +6,7 @@ from collections import deque
 from typing import Iterable
 
 import numpy as np
+from PIL import Image
 
 from .config import (
     match_tolerance,
@@ -107,6 +108,83 @@ def classify_reward_bubble(crop_rgb: np.ndarray, allowed_names: set[str]) -> tup
     return None
 
 
+def reward_bubble_pixel_fractions(crop_rgb: np.ndarray) -> tuple[float, float, float, float]:
+    rgb = crop_rgb.astype(np.int16)
+    red = rgb[:, :, 0]
+    green = rgb[:, :, 1]
+    blue = rgb[:, :, 2]
+
+    white_pixels = (red > 205) & (green > 205) & (blue > 205)
+    dark_detail_pixels = (red < 80) & (green < 80) & (blue < 90)
+    brown_pixels = (
+        (red > 75)
+        & (red < 190)
+        & (green > 35)
+        & (green < 135)
+        & (blue < 120)
+        & (red > green + 10)
+    )
+    blue_pixels = (
+        (blue > 120)
+        & (green > 70)
+        & (red < 120)
+        & (blue > red + 35)
+    )
+    return (
+        float(white_pixels.mean()),
+        float(dark_detail_pixels.mean()),
+        float(brown_pixels.mean()),
+        float(blue_pixels.mean()),
+    )
+
+
+def reward_bubble_has_plausible_signature(crop_rgb: np.ndarray, name: str, config: dict) -> bool:
+    if not bool(config.get("reward_box_signature_validation", True)):
+        return True
+
+    white_fraction, _dark_fraction, brown_fraction, _blue_fraction = reward_bubble_pixel_fractions(crop_rgb)
+    if name == "reward_chest_bubble":
+        return (
+            white_fraction >= float(config.get("reward_box_chest_white_min_fraction", 0.18))
+            and brown_fraction <= float(config.get("reward_box_chest_brown_max_fraction", 0.18))
+        )
+    if name == "reward_blue_box_bubble":
+        return (
+            white_fraction >= float(config.get("reward_box_blue_white_min_fraction", 0.15))
+            and brown_fraction <= float(config.get("reward_box_blue_brown_max_fraction", 0.12))
+        )
+    return False
+
+
+def reward_bubble_template_score(crop_rgb: np.ndarray, template: Template, config: dict) -> float:
+    if not bool(config.get("reward_box_template_validation", True)):
+        return 1.0
+
+    tolerance = int(config.get("reward_box_template_tolerance", 90))
+    best_score = 0.0
+    for candidate in (template, *template.variants):
+        sample = crop_rgb
+        if sample.shape[1] != candidate.width or sample.shape[0] != candidate.height:
+            image = Image.fromarray(sample)
+            image = image.resize((candidate.width, candidate.height), Image.Resampling.BICUBIC)
+            sample = np.asarray(image, dtype=np.uint8)
+
+        diffs = np.abs(sample.astype(np.int16) - candidate.rgb.astype(np.int16))
+        masked_diffs = diffs[candidate.mask]
+        if masked_diffs.size == 0:
+            continue
+        per_pixel_ok = np.max(masked_diffs, axis=1) <= tolerance
+        ok_score = float(per_pixel_ok.mean())
+        mean_diff = float(masked_diffs.mean())
+        structural_score = ok_score * 0.75 + max(0.0, 1.0 - mean_diff / 120.0) * 0.25
+        best_score = max(best_score, structural_score)
+    return best_score
+
+
+def reward_bubble_minimum_template_score(config: dict) -> float:
+    return float(config.get("reward_box_template_min_score", 0.54))
+
+
 def reward_box_shape_minimum_score(name: str, config: dict) -> float:
     minimum = float(config.get("reward_box_shape_min_score", 0.62))
     if name == "reward_blue_box_bubble":
@@ -196,6 +274,8 @@ def reward_box_match_has_valid_context(screen: ScreenShot, match: Match, config:
         return False
 
     classified_name, shape_score = classified
+    if not reward_bubble_has_plausible_signature(crop_rgb, classified_name, config):
+        return False
     return classified_name == match.name and shape_score >= reward_box_shape_minimum_score(match.name, config)
 
 
@@ -206,6 +286,7 @@ def find_reward_bubble_by_shape(
     blocked_names: set[str] | None = None,
     blocked_positions: set[tuple[str, int, int]] | None = None,
     row_center_y: int | None = None,
+    templates: dict[str, Template] | None = None,
 ) -> Match | None:
     if not bool(config.get("reward_box_shape_fallback", True)):
         return None
@@ -223,106 +304,128 @@ def find_reward_bubble_by_shape(
     max_w = max(min_w + 1, int(round(90 * max_scale)))
     min_h = max(14, int(round(22 * min_scale)))
     max_h = max(min_h + 1, int(round(65 * max_scale)))
-    min_area = max(120, int(round(180 * min_scale * min_scale)))
+    min_area = max(120, int(round(150 * min_scale * min_scale)))
     bridge_x = max(0, int(round(int(config.get("reward_box_shape_bridge_x", 2)) * max_scale)))
     bridge_y = max(0, int(round(int(config.get("reward_box_shape_bridge_y", 5)) * max_scale)))
 
     rgb = screen.rgb
-    whiteish = (rgb[:, :, 0] > 210) & (rgb[:, :, 1] > 210) & (rgb[:, :, 2] > 210)
-    search_mask = dilate_boolean_mask(whiteish, bridge_x, bridge_y)
-    height, width = whiteish.shape
+    red = rgb[:, :, 0]
+    green = rgb[:, :, 1]
+    blue = rgb[:, :, 2]
+    whiteish = (red > 210) & (green > 210) & (blue > 210)
+    light_blueish = (blue > 150) & (green > 120) & (red < 210) & (blue > red + 20)
+    bubbleish = whiteish | light_blueish
+    search_mask = dilate_boolean_mask(bubbleish, bridge_x, bridge_y)
+    height, width = bubbleish.shape
     candidates: list[tuple[Match, float]] = []
+    candidate_keys: set[tuple[str, int, int, int, int]] = set()
 
     def append_candidate(crop_left: int, crop_top: int, crop_right: int, crop_bottom: int) -> None:
         if crop_right <= crop_left or crop_bottom <= crop_top:
             return
         crop_rgb = rgb[crop_top:crop_bottom, crop_left:crop_right, :]
-        classified = classify_reward_bubble(crop_rgb, allowed_names)
-        if not classified:
-            return
-        name, score = classified
-        if score < reward_box_shape_minimum_score(name, config):
-            return
-        candidate_scale = estimate_reward_box_scale(crop_right - crop_left, crop_bottom - crop_top, scales)
-        candidates.append(
-            (
-                Match(
-                    name=name,
-                    left=int(screen.origin_x + crop_left),
-                    top=int(screen.origin_y + crop_top),
-                    width=int(crop_right - crop_left),
-                    height=int(crop_bottom - crop_top),
-                    score=float(score),
-                    mean_diff=0.0,
-                    scale=candidate_scale,
-                ),
-                score,
+        for name in allowed_names:
+            if not reward_bubble_has_plausible_signature(crop_rgb, name, config):
+                continue
+            classified = classify_reward_bubble(crop_rgb, {name})
+            if not classified:
+                continue
+            _classified_name, shape_score = classified
+            if shape_score < reward_box_shape_minimum_score(name, config):
+                continue
+
+            score = shape_score
+            if templates and name in templates:
+                template_score = reward_bubble_template_score(crop_rgb, templates[name], config)
+                if template_score < reward_bubble_minimum_template_score(config):
+                    continue
+                score = template_score
+
+            key = (name, crop_left, crop_top, crop_right, crop_bottom)
+            if key in candidate_keys:
+                continue
+            candidate_keys.add(key)
+            candidate_scale = estimate_reward_box_scale(crop_right - crop_left, crop_bottom - crop_top, scales)
+            candidates.append(
+                (
+                    Match(
+                        name=name,
+                        left=int(screen.origin_x + crop_left),
+                        top=int(screen.origin_y + crop_top),
+                        width=int(crop_right - crop_left),
+                        height=int(crop_bottom - crop_top),
+                        score=float(score),
+                        mean_diff=0.0,
+                        scale=candidate_scale,
+                    ),
+                    score,
+                )
             )
-        )
 
     for min_x, min_y, max_x, max_y, _count in iter_mask_components(search_mask):
-        component_white = whiteish[min_y : max_y + 1, min_x : max_x + 1]
-        true_white_count = int(component_white.sum())
-        if true_white_count <= 0:
+        component_mask = bubbleish[min_y : max_y + 1, min_x : max_x + 1]
+        true_bubble_count = int(component_mask.sum())
+        if true_bubble_count <= 0:
             continue
-        white_ys, white_xs = np.nonzero(component_white)
-        content_min_x = min_x + int(white_xs.min())
-        content_max_x = min_x + int(white_xs.max())
-        content_min_y = min_y + int(white_ys.min())
-        content_max_y = min_y + int(white_ys.max())
+        mask_ys, mask_xs = np.nonzero(component_mask)
+        content_min_x = min_x + int(mask_xs.min())
+        content_max_x = min_x + int(mask_xs.max())
+        content_min_y = min_y + int(mask_ys.min())
+        content_max_y = min_y + int(mask_ys.max())
         box_w = content_max_x - content_min_x + 1
         box_h = content_max_y - content_min_y + 1
-        if true_white_count < min_area or box_w < min_w or box_w > max_w or box_h < min_h or box_h > max_h:
+        if true_bubble_count < min_area or box_w < min_w or box_w > max_w or box_h < min_h or box_h > max_h:
             continue
 
         aspect = box_w / max(1, box_h)
-        white_density = true_white_count / max(1, box_w * box_h)
-        if aspect < 0.9 or aspect > 3.8 or white_density < 0.10:
+        bubble_density = true_bubble_count / max(1, box_w * box_h)
+        if aspect < 0.8 or aspect > 3.8 or bubble_density < 0.08:
             continue
 
         candidate_scale = estimate_reward_box_scale(box_w, box_h, scales)
-        pad = max(2, int(round(4 * candidate_scale)))
+        pad = max(1, int(round(2 * candidate_scale)))
         crop_left = max(0, content_min_x - pad)
         crop_top = max(0, content_min_y - pad)
         crop_right = min(width, content_max_x + pad + 1)
         crop_bottom = min(height, content_max_y + pad + 1)
         append_candidate(crop_left, crop_top, crop_right, crop_bottom)
 
-    raw_min_count = max(20, int(round(16 * min_scale * min_scale)))
+    raw_min_count = max(8, int(round(10 * min_scale * min_scale)))
     seen_windows: set[tuple[int, int, int, int]] = set()
 
-    for min_x, min_y, max_x, max_y, count in iter_mask_components(whiteish):
-        if count < raw_min_count:
-            continue
-        raw_w = max_x - min_x + 1
-        raw_h = max_y - min_y + 1
-        if raw_w > max_w or raw_h > max_h:
-            continue
-        base_x = (min_x + max_x) // 2
-        base_y = (min_y + max_y) // 2
-        for scale in scales:
-            scale_min_area = max(20, int(round(160 * scale * scale)))
-            window_w = max(min_w, int(round(64 * scale)))
-            window_h = max(min_h, int(round(46 * scale)))
-            x_offsets = tuple(int(round(value * scale)) for value in (-18, 0, 18))
-            y_offsets = tuple(int(round(value * scale)) for value in (-6, 0, 6))
-            for offset_x in x_offsets:
-                for offset_y in y_offsets:
-                    center_x = base_x + offset_x
-                    center_y = base_y + offset_y
-                    crop_left = max(0, center_x - window_w // 2)
-                    crop_top = max(0, center_y - window_h // 2)
-                    crop_right = min(width, crop_left + window_w)
-                    crop_bottom = min(height, crop_top + window_h)
-                    if crop_right - crop_left < window_w or crop_bottom - crop_top < window_h:
-                        continue
-                    key = (crop_left, crop_top, crop_right, crop_bottom)
-                    if key in seen_windows:
-                        continue
-                    seen_windows.add(key)
-                    if int(whiteish[crop_top:crop_bottom, crop_left:crop_right].sum()) < scale_min_area:
-                        continue
-                    append_candidate(crop_left, crop_top, crop_right, crop_bottom)
+    for raw_mask in (whiteish, light_blueish, bubbleish):
+        for min_x, min_y, max_x, max_y, count in iter_mask_components(raw_mask):
+            if count < raw_min_count:
+                continue
+            raw_w = max_x - min_x + 1
+            raw_h = max_y - min_y + 1
+            if raw_w > max_w or raw_h > max_h:
+                continue
+            base_x = (min_x + max_x) // 2
+            base_y = (min_y + max_y) // 2
+            for scale in scales:
+                scale_min_area = max(20, int(round(80 * scale * scale)))
+                window_w = max(min_w, int(round(64 * scale)))
+                window_h = max(min_h, int(round(46 * scale)))
+                x_offsets = tuple(int(round(value * scale)) for value in (-18, 0, 18))
+                y_offsets = tuple(int(round(value * scale)) for value in (-6, 0, 6))
+                for offset_x in x_offsets:
+                    for offset_y in y_offsets:
+                        center_x = base_x + offset_x
+                        center_y = base_y + offset_y
+                        crop_left = max(0, center_x - window_w // 2)
+                        crop_top = max(0, center_y - window_h // 2)
+                        crop_right = min(width, crop_left + window_w)
+                        crop_bottom = min(height, crop_top + window_h)
+                        if crop_right - crop_left < window_w or crop_bottom - crop_top < window_h:
+                            continue
+                        key = (crop_left, crop_top, crop_right, crop_bottom)
+                        if key in seen_windows:
+                            continue
+                        seen_windows.add(key)
+                        if int(bubbleish[crop_top:crop_bottom, crop_left:crop_right].sum()) < scale_min_area:
+                            continue
+                        append_candidate(crop_left, crop_top, crop_right, crop_bottom)
 
     if row_center_y is not None or blocked_positions:
         filtered_candidates: list[tuple[Match, float]] = []
@@ -367,9 +470,6 @@ def find_reward_bubble_by_shape(
         if match.name not in allowed_names:
             continue
         pair_bonus = reward_pair_bonus(match)
-        pair_required = row_center_y is None and bool(config.get("reward_box_pair_required_without_row", True))
-        if pair_required and pair_bonus <= 0:
-            continue
         rank = score + pair_bonus
         if row_center_y is not None:
             rank += 0.25
@@ -443,6 +543,7 @@ def find_reward_box_for_opening(
             blocked_names,
             blocked_positions,
             row_center_y,
+            templates,
         )
         if fallback:
             return fallback

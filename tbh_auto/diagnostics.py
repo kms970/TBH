@@ -66,7 +66,7 @@ def scan_templates(
             if not match and name == "auto_fill":
                 match = find_auto_fill_button_by_shape(screen, config)
             if not match and name in REWARD_BOX_TEMPLATES:
-                match = find_reward_bubble_by_shape(screen, (name,), config)
+                match = find_reward_bubble_by_shape(screen, (name,), config, templates=templates)
         matches[name] = match
         if match:
             print(
